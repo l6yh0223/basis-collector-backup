@@ -1,0 +1,42 @@
+name: basis-collector
+
+on:
+  schedule:
+    - cron: '25 1 * * 1-5'
+    - cron: '55 4 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Run duration in seconds'
+        required: false
+        default: '120'
+      interval:
+        description: 'Poll interval seconds'
+        required: false
+        default: '2'
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run collector
+        run: |
+          python3 collector.py --seconds "${{ github.event.inputs.seconds || '7800' }}" --interval "${{ github.event.inputs.interval || '2' }}" --outdir data &
+          COLLECTOR_PID=$!
+          while kill -0 $COLLECTOR_PID 2>/dev/null; do
+            sleep 300
+            git config user.name "basis-collector-bot"
+            git config user.email "basis-collector-bot@users.noreply.github.com"
+            git add data/latest.json data/basis-*.jsonl data/extremes-*.json 2>/dev/null || true
+            git diff --cached --quiet || git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+            git push || git pull --rebase && git push || true
+          done
+          wait $COLLECTOR_PID
+          git add data/latest.json data/basis-*.jsonl data/extremes-*.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "final snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push || git pull --rebase && git push || true
