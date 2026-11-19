@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""2-second public-basis collector, runs on InstaBox box-1.
+"""2-second public-basis collector, runs on InstaBox box-1 and on GitHub Actions (basis-collector workflow).
 
 Two stages, matching the cloud-computer division of labour
 (user, 2026-11-15): the WATCH stage fetches raw legs and index
@@ -18,20 +18,19 @@ tick behaviour still to be validated on a trading day):
   (hands; verified 2026-11-15: equals field [36] and the volume in
   the field [35] composite, and [7]+[8]=[6]); turnover is field [37]
   (10k CNY; verified against the field [35] turnover).
-- Futures: Sina hq.sinajs.cn, CFF_IH2611/CFF_IF2611/CFF_IC2611, with a
+- Futures: Sina hq.sinajs.cn, CFF_IH2612/CFF_IF2612/CFF_IC2612, with a
   Referer header (without it Sina returns 403). Last price is field [3],
   quote time is field [-2]. Volume is field [4] (lots; verified
   2026-11-15: field [5]/[4] equals the session average price for all
-  three contracts). Open interest is field [14] (UNVERIFIED: inferred
-  from magnitude only on a single close sample; field [6] is 0 and is
-  NOT open interest). Price mapping was deduced from the 2026-11-13
+  three contracts). Open interest is field [14] (INVALIDATED 2026-11-16: constant
+  intraday, not live open interest; never use it for OI judgments). Price mapping was deduced from the 2026-11-13
   close sample and MUST be cross-checked against the user's
   software-displayed basis on the first live session; the
   open-interest mapping must be validated separately (intraday
   behaviour + software cross-check) before it is used as anything
   but reference.
 
-IM2611 has NO working public source from box-1: Sina returns
+IM2612 has NO working public source from box-1: Sina returns
 wrong-level data (~6300 instead of ~2400), Eastmoney/126/Tencent are
 unreachable. IM is recorded as null, never computed from bad data.
 
@@ -48,11 +47,18 @@ sim book and live advice; the user's software-displayed basis, sent
 about every 30 minutes, is cross-check only and governs on any
 material conflict (user decision, 2026-11-15).
 
-Each poll also maintains extremes-YYYYMMDD.json: per-contract open,
-high/low with timestamps, AM/PM session extremes, last value, range,
-previous-day close comparison, and a data-quality section (poll/error
-counts, max gap). It is updated read-modify-write every poll so the
-AM/PM sessions and restarts share one record.
+A futures leg whose quote timestamp is stale (not dated today, or more
+than 60s behind the poll) produces NO basis value: Sina intermittently
+serves ~3-minute-old cached quotes that print false basis extremes while
+the ETF leg sits flat (proven 2026-11-16).
+
+Each poll also maintains extremes-YYYYMMDD.json: per-contract open (the
+09:35 anchor read; opening first prints are untrusted), high/low with
+timestamps, AM/PM session extremes, last value, range, previous-day close
+comparison, the four anchor reads (09:35/13:05/11:20/14:50), and a
+data-quality section (poll/error counts, max gap). It is updated
+read-modify-write every poll so the AM/PM sessions and restarts share one
+record.
 """
 import argparse
 import json
@@ -66,12 +72,12 @@ from datetime import datetime, timedelta, timezone
 
 CST = timezone(timedelta(hours=8))
 ETF_URL = "http://qt.gtimg.cn/q=sh000001,sh510050,sh510300,sh510500,sh512100"
-FUT_URL = "http://hq.sinajs.cn/list=CFF_IH2611,CFF_IF2611,CFF_IC2611"
+FUT_URL = "http://hq.sinajs.cn/list=CFF_IH2612,CFF_IF2612,CFF_IC2612"
 INDEX_RANGE = (1000.0, 10000.0)
 CONTRACTS = {
-    "IH": ("510050", "IH2611", 1000.0, 5000.0),
-    "IF": ("510300", "IF2611", 2000.0, 7000.0),
-    "IC": ("510500", "IC2611", 3000.0, 10000.0),
+    "IH": ("510050", "IH2612", 1000.0, 5000.0),
+    "IF": ("510300", "IF2612", 2000.0, 7000.0),
+    "IC": ("510500", "IC2612", 3000.0, 10000.0),
 }
 ETF_RANGE = (0.5, 20.0)
 FETCH_TIMEOUT = 2.0
@@ -191,7 +197,28 @@ def fetch_stage(errors):
     return {"etf": etf, "fut": fut, "indices": indices}
 
 
-def compute_stage(legs, errors):
+MAX_FUT_LAG_S = 60.0
+
+
+def _leg_fresh(src_time, now_cst):
+    """Sina intermittently serves a ~3-minute-old cached futures quote
+    interleaved with fresh quotes (proven 2026-11-16: fresh lag p50 9s,
+    stale lag 60-315s). A stale leg prints false basis extremes while the
+    ETF leg sits flat, so it must not produce a basis value. Unparseable
+    timestamps keep the old behaviour (compute) so a format quirk cannot
+    blank the whole feed."""
+    if not src_time:
+        return True
+    if str(src_time)[:10] != now_cst.strftime("%Y-%m-%d"):
+        return False
+    try:
+        lag = (now_cst - datetime.fromisoformat(src_time)).total_seconds()
+    except ValueError:
+        return True
+    return 0 <= lag <= MAX_FUT_LAG_S
+
+
+def compute_stage(legs, errors, now_cst):
     """COMPUTE stage: derive basis from the fetched legs only."""
     etf, fut = legs["etf"], legs["fut"]
     basis = {}
@@ -205,6 +232,10 @@ def compute_stage(legs, errors):
             errors.append("fut %s price out of range: %s" % (fut_code, f["price"]))
             basis[name] = None
             continue
+        if not _leg_fresh(f["src_time"], now_cst):
+            errors.append("fut %s stale leg: src_time %s" % (fut_code, f["src_time"]))
+            basis[name] = None
+            continue
         basis[name] = round(e["price"] * 1000.0 - f["price"], 2)
     return basis
 
@@ -214,7 +245,7 @@ def poll():
     now_epoch = time.time()
     now_cst = datetime.fromtimestamp(now_epoch, CST)
     legs = fetch_stage(errors)
-    basis = compute_stage(legs, errors)
+    basis = compute_stage(legs, errors, now_cst)
     return {
         "ts_epoch": round(now_epoch, 3),
         "ts_cst": now_cst.isoformat(timespec="seconds"),
@@ -241,6 +272,15 @@ def _session_of(ts_cst):
 
 def _prev_close(outdir, date_yyyymmdd):
     """Most recent earlier extremes file's last values, up to 5 days back."""
+    # 换月断点（仓库链）：仓库 data/ 里 20261119 的 extremes 文件是 11 月合约口径，
+    # 其 last（IH 117.0/IF 89.0/IC 42.2）不能当 12 月的 prev_close。
+    # 11-19 当晚再跑，用 11-18 的 12 月可交易收盘（用户收盘包：IH 151.3/IF 126.8/IC 123.0）；
+    # 11-20 用 11-19 的 12 月可交易收盘（用户收盘包：IH 153.3/IF 136.6/IC 104.1）。
+    # 各仅当天生效，之后恢复正常链式读取。
+    if date_yyyymmdd == "20261119":
+        return {"IH": 151.3, "IF": 126.8, "IC": 123.0}
+    if date_yyyymmdd == "20261120":
+        return {"IH": 153.3, "IF": 136.6, "IC": 104.1}
     try:
         base = datetime.strptime(date_yyyymmdd, "%Y%m%d").date()
     except ValueError:
@@ -281,10 +321,28 @@ def update_extremes(outdir, row):
             "contracts": {},
             "im": None,
             "im_note": "no working public source from box-1; use software basis only",
+            "anchors": {"0935": None, "1305": None, "1120": None, "1450": None},
             "quality": {"polls": 0, "errors": 0, "max_gap_s": 0.0,
                         "last_ts_epoch": None},
         }
     session = _session_of(row["ts_cst"])
+    # Anchor reads (user rule 2026-11-16): open/close references use ONLY
+    # 09:35, 13:05, 11:20, 14:50. Filled per contract from the first row in
+    # the 60s window after the anchor time with a usable (fresh-leg) value;
+    # the recompute script later refines them to anchor-minute medians.
+    anchors = state.setdefault(
+        "anchors", {"0935": None, "1305": None, "1120": None, "1450": None})
+    row_t = row["ts_cst"][11:19]
+    for label, at in (("0935", "09:35:00"), ("1305", "13:05:00"),
+                      ("1120", "11:20:00"), ("1450", "14:50:00")):
+        if at <= row_t <= at[:6] + "59":
+            slot = anchors.get(label)
+            if slot is None:
+                slot = {"IH": None, "IF": None, "IC": None}
+                anchors[label] = slot
+            for name, value in row["basis"].items():
+                if slot.get(name) is None and value is not None:
+                    slot[name] = value
     quality = state["quality"]
     last_epoch = quality.get("last_ts_epoch")
     if last_epoch is not None:
@@ -300,13 +358,18 @@ def update_extremes(outdir, row):
             continue
         rec = state["contracts"].get(name)
         if rec is None:
-            rec = {"open": value, "open_ts": row["ts_cst"], "high": value,
+            anchored = row["ts_cst"][11:19] >= "09:35:00"
+            rec = {"open": value if anchored else None,
+                   "open_ts": row["ts_cst"] if anchored else None,
+                   "high": value,
                    "high_ts": row["ts_cst"], "low": value, "low_ts": row["ts_cst"],
                    "am_high": None, "am_high_ts": None, "am_low": None,
                    "am_low_ts": None, "pm_high": None, "pm_high_ts": None,
                    "pm_low": None, "pm_low_ts": None, "last": value,
                    "last_ts": row["ts_cst"]}
             state["contracts"][name] = rec
+        if rec.get("open") is None and row["ts_cst"][11:19] >= "09:35:00":
+            rec["open"], rec["open_ts"] = value, row["ts_cst"]
         if value > rec["high"]:
             rec["high"], rec["high_ts"] = value, row["ts_cst"]
         if value < rec["low"]:
